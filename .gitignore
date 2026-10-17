@@ -30,3 +30,7 @@
 *.exe
 *.out
 *.app
+tools/bg_strip.ps1
+tools/make_icon.ps1
+tools/shot_widget.ps1
+tools/test_menu.ps1
