@@ -278,7 +278,7 @@ struct Config {
 // --------------------------------------------------------------------------
 static const wchar_t* kWidgetClass = L"CodexTaskbarWidget_v1";
 static const wchar_t* kAnchorClass = L"CodexTaskbarAnchor_v1";
-static const int kWidgetW = 236;
+static const int kWidgetW = 208;
 
 static const UINT WM_TRAY      = WM_APP + 1;
 static const UINT WM_REFRESHED = WM_APP + 2;
@@ -874,6 +874,10 @@ static Usage FetchUsage() {
 static std::wstring FormatRemaining(long long secs, bool longWindow) {
     wchar_t b[64];
     if (secs <= 0) return L"0m";
+    // Round up to a whole minute. The provider re-reports reset_at on every
+    // poll with a second or two of jitter, so a raw second count made a full
+    // window flip between "5h 00m" and "4h 59m" (and every other value).
+    secs = ((secs + 59) / 60) * 60;
     long long h = secs / 3600, m = (secs % 3600) / 60;
     if (longWindow) {
         long long d = h / 24;
@@ -910,6 +914,10 @@ static LimitState EvalLimit(const WndInfo& w, long long now) {
     s.valid = true;
     s.usedPct = std::max(0.0, std::min(100.0, w.used));
     s.resetInSec = w.resetAt > 0 ? w.resetAt - now : 0;
+    // A window can never have more than its own length left. The provider
+    // reports reset_at a second or two ahead of "now" for a completely fresh
+    // window, which would otherwise read as "5h 01m"; clamp it away.
+    if (w.windowSec > 0 && s.resetInSec > w.windowSec) s.resetInSec = w.windowSec;
     if (w.resetAt > 0 && now >= w.resetAt) {
         // The stored percentage predates the reset, so it no longer describes
         // the new window. Present a fresh window, but flag it as pending rather
@@ -933,7 +941,7 @@ static void EnsureFonts(int dpi, int quality = CLEARTYPE_QUALITY) {
                            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                            quality, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     };
-    g_fMain  = mk(13, FW_SEMIBOLD);
+    g_fMain  = mk(13, FW_NORMAL);
     g_fSmall = mk(12, FW_NORMAL);
     g_fTiny  = mk(11, FW_NORMAL);
     g_fontDpi = dpi;
@@ -1116,17 +1124,19 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
         DeleteObject(db);
 
         int tx = x + px(13);
-        DrawTextAt(mem, label, tx, top, px(26), rowH, g_fTiny, th.dim, DT_LEFT | DT_VCENTER);
+        DrawTextAt(mem, label, tx, top, px(22), rowH, g_fTiny, th.dim, DT_LEFT | DT_VCENTER);
 
-        int barX = tx + px(26);
-        int barW = px(56);
+        int barX = tx + px(22);
+        int barW = px(48);
         int barH = px(rows > 1 ? 6 : 8);
         DrawBar(mem, barX, cy - barH / 2, barW, barH, shown, accent, th.track);
 
-        int pctX = barX + barW + px(7);
-        DrawTextAt(mem, pctText, pctX, top, px(46), rowH,
+        int pctX = barX + barW + px(6);
+        DrawTextAt(mem, pctText, pctX, top, px(44), rowH,
                    g_fMain, locked ? th.red : th.text, DT_LEFT | DT_VCENTER);
 
+        // The time stays pinned to the right edge; the narrower widget is what
+        // shrinks the empty gap in the middle of the row.
         int timeX = pctX + px(44);
         int timeW = w - timeX - px(6);
         std::wstring timeText;
@@ -1146,7 +1156,7 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
         // Log-derived numbers are flagged in the widget, not only in the tooltip.
         if (u.stale && st.valid) timeText = L"log " + timeText;
         DrawTextAt(mem, timeText, timeX, top, timeW, rowH,
-                   locked ? g_fMain : g_fSmall, timeColor, DT_RIGHT | DT_VCENTER);
+                   locked ? g_fMain : g_fSmall, timeColor, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
     };
 
     int hours = u.primary.windowSec > 0 ? (int)(u.primary.windowSec / 3600) : 5;

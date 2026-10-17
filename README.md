@@ -15,7 +15,7 @@ but Codex-only, dependency-free, and with taskbar hosting that behaves properly 
 | | |
 | --- | --- |
 | Codex usage | remaining (default) or used percentage for the 5-hour and weekly windows |
-| Reset countdown | accurate to the second, in hours and minutes — `1h 02m`, weekly as `5d 3h` |
+| Reset countdown | hours and minutes, rounded up so a fresh window reads a steady `5h 00m` instead of flickering to `4h 59m` — `1h 02m`, weekly as `5d 3h` |
 | Taskbar widget | the window is **parented into `Shell_TrayWnd`** (the same technique TrafficMonitor uses), not floating above the taskbar |
 | Seamless background | transparent by default (color-key, no painted background at all); two alternatives available |
 | Notifications | Windows toast when a limit is exhausted and when it becomes available again |
