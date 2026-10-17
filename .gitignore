@@ -34,3 +34,17 @@ tools/bg_strip.ps1
 tools/make_icon.ps1
 tools/shot_widget.ps1
 tools/test_menu.ps1
+
+# Credentials and private Codex data
+auth.json
+.codex/
+.env
+.env.*
+rollout-*.jsonl
+
+# Local settings and diagnostic files
+config.ini
+dump.txt
+
+# Build artifacts
+build/

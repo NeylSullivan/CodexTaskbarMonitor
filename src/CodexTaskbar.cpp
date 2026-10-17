@@ -39,6 +39,7 @@
 #include <cctype>
 #include <cstdint>
 #include <ctime>
+#include <atomic>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -256,7 +257,8 @@ struct Usage {
     bool stale = false;
     std::wstring source;
     std::wstring error;
-    long long fetchedAt = 0;
+    long long fetchedAt = 0;  // when this reading was performed
+    long long sampleAt = 0;   // when the underlying measurement was created (0 = unknown)
 };
 
 struct Config {
@@ -302,9 +304,12 @@ static bool g_attached = false;
 static bool g_havePrev = false;
 static bool g_prevLockP = false;
 static bool g_prevLockS = false;
+static bool g_prevTrust = false;
 static int  g_dpi = 96;
 static ULONGLONG g_nextPollDue = 0;
-static bool g_fetching = false;
+static std::atomic<bool> g_fetching{false};
+static std::atomic<bool> g_shutdown{false};
+static std::thread g_fetchThread;   // the one in-flight worker; joined before starting the next
 static bool g_menuOpen = false;
 static int  g_testMode = 0;
 static int  g_testPhase = 0;
@@ -319,6 +324,7 @@ static Config g_cfg;
 static HFONT g_fMain = nullptr, g_fSmall = nullptr, g_fTiny = nullptr;
 static HICON g_trayIcon = nullptr;
 static bool  g_trayAdded = false;
+static bool  g_trayResetPending = false;   // last reset-pending state shown in the tray
 static int   g_fontDpi = 0;
 static int   g_fontQuality = CLEARTYPE_QUALITY;
 static int   g_bgEffective = 1;   // runtime background mode after capability fallback
@@ -641,6 +647,17 @@ static HttpResp HttpGet(const std::wstring& host, const std::wstring& path,
                                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!req) { out.error = L"Request failed"; WinHttpCloseHandle(con); WinHttpCloseHandle(ses); return out; }
 
+    // This request carries an Authorization: Bearer token, so redirects must be
+    // refused outright: a redirect target could otherwise receive the token.
+    // If the policy cannot be applied, abort instead of sending the token with
+    // an unknown redirect behaviour.
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if (!WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy))) {
+        out.error = L"Could not disable HTTP redirects";
+        WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+        return out;
+    }
+
     for (const auto& h : headers) {
         std::wstring line = h.first + L": " + h.second;
         WinHttpAddRequestHeaders(req, line.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
@@ -721,6 +738,41 @@ static std::wstring NewestRollout() {
     return best.path;
 }
 
+// Parses an ISO-8601 UTC timestamp such as "2025-04-16T18:33:16.542Z".
+// Returns 0 when the value is missing or malformed (age is then unknown).
+static long long ParseIso8601Utc(const std::string& s) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    if (sscanf_s(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
+    struct tm tmv{};
+    tmv.tm_year = y - 1900;
+    tmv.tm_mon  = mo - 1;
+    tmv.tm_mday = d;
+    tmv.tm_hour = h;
+    tmv.tm_min  = mi;
+    tmv.tm_sec  = se;
+    time_t t = _mkgmtime(&tmv);
+    return t > 0 ? (long long)t : 0;
+}
+
+// Unix seconds from a possibly millisecond/microsecond epoch value.
+static long long NormalizeEpochSeconds(long long v) {
+    if (v <= 0) return 0;
+    while (v > 100000000000LL) v /= 1000;   // ms, then microseconds
+    return v;
+}
+
+// Creation time of a rollout record, never the file's modification time.
+static long long RecordTimestamp(const JVal& v) {
+    if (const JVal* ts = v.Get("timestamp")) {
+        if (ts->t == JVal::Str) { long long t = ParseIso8601Utc(ts->str); if (t > 0) return t; }
+        if (ts->t == JVal::Num) return NormalizeEpochSeconds((long long)ts->num);
+    }
+    if (const JVal* ts = v.Get("ts"))
+        if (ts->t == JVal::Num) return NormalizeEpochSeconds((long long)ts->num);
+    return 0;
+}
+
 static bool LoadFromRollout(Usage& u) {
     std::wstring file = NewestRollout();
     if (file.empty()) return false;
@@ -754,6 +806,10 @@ static bool LoadFromRollout(Usage& u) {
         u.source = L"Codex session log";
         u.ok = true;
         u.fetchedAt = (long long)time(nullptr);
+        // The percentage belongs to the moment the record was written, not to
+        // the moment we read it; 0 means the record carries no usable time.
+        u.sampleAt = RecordTimestamp(v);
+        if (u.sampleAt == 0) u.sampleAt = RecordTimestamp(*payload);
         return true;
     }
     return false;
@@ -784,6 +840,7 @@ static Usage FetchUsage() {
                     u.ok = true;
                     u.source = L"API Codex";
                     u.fetchedAt = (long long)time(nullptr);
+                    u.sampleAt = u.fetchedAt;   // the API answers with current numbers
                     return u;
                 }
                 u.error = L"API returned no limit data";
@@ -834,6 +891,36 @@ static std::wstring PercentText(double pct) {
     wchar_t b[32];
     swprintf_s(b, L"%d%%", (int)llround(std::max(0.0, std::min(100.0, pct))));
     return b;
+}
+
+// The single authoritative view of a limit window. The widget, the tray icon,
+// the tooltip and the notification logic all derive from this, so they can never
+// disagree about the percentage, severity, reset time or confidence.
+struct LimitState {
+    bool valid = false;
+    double usedPct = 0.0;      // normalized 0..100 used
+    bool exhausted = false;    // confirmed 100% used
+    bool resetPending = false; // resetAt has passed but no fresh sample exists yet
+    long long resetInSec = 0;  // seconds until reset (<= 0 when passed/unknown)
+};
+
+static LimitState EvalLimit(const WndInfo& w, long long now) {
+    LimitState s;
+    if (!w.valid) return s;
+    s.valid = true;
+    s.usedPct = std::max(0.0, std::min(100.0, w.used));
+    s.resetInSec = w.resetAt > 0 ? w.resetAt - now : 0;
+    if (w.resetAt > 0 && now >= w.resetAt) {
+        // The stored percentage predates the reset, so it no longer describes
+        // the new window. Present a fresh window, but flag it as pending rather
+        // than asserting 0% used / 100% remaining as confirmed fact.
+        s.resetPending = true;
+        s.usedPct = 0.0;
+        s.exhausted = false;
+    } else {
+        s.exhausted = s.usedPct >= 99.5;
+    }
+    return s;
 }
 
 static void EnsureFonts(int dpi, int quality = CLEARTYPE_QUALITY) {
@@ -1008,16 +1095,16 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
         const int top = rowIdx * rowH;
         const int cy = top + rowH / 2;
         int x = px(8);
-        long long now = (long long)time(nullptr);
-        double usedPct = wi.valid ? wi.used : 0.0;
-        long long remain = wi.valid && wi.resetAt > 0 ? wi.resetAt - now : 0;
-        bool resetPassed = wi.valid && remain <= 0;
-        if (resetPassed) usedPct = 0.0;   // window already rolled over server-side
-        usedPct = std::max(0.0, std::min(100.0, usedPct));
-        bool locked = wi.valid && usedPct >= 99.5 && !resetPassed;
-        COLORREF accent = wi.valid ? accentFor(usedPct) : th.dim;
+        const long long now = (long long)time(nullptr);
+        LimitState st = EvalLimit(wi, now);
+        double usedPct = st.usedPct;
+        long long remain = st.resetInSec;
+        bool locked = st.exhausted;
+        COLORREF accent = st.valid ? accentFor(usedPct) : th.dim;
         // "Remaining" is the default view: a fresh window reads 100% and drains.
         double shown = (g_cfg.displayMode == 0) ? (100.0 - usedPct) : usedPct;
+        std::wstring pctText = st.valid ? PercentText(shown) : L"—";
+        if (st.valid && st.resetPending) pctText = L"~" + pctText;   // assumed, not measured
 
         HBRUSH db = CreateSolidBrush(accent);
         HGDIOBJ op = SelectObject(mem, GetStockObject(NULL_PEN));
@@ -1037,15 +1124,18 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
         DrawBar(mem, barX, cy - barH / 2, barW, barH, shown, accent, th.track);
 
         int pctX = barX + barW + px(7);
-        DrawTextAt(mem, wi.valid ? PercentText(shown) : L"—", pctX, top, px(44), rowH,
+        DrawTextAt(mem, pctText, pctX, top, px(46), rowH,
                    g_fMain, locked ? th.red : th.text, DT_LEFT | DT_VCENTER);
 
-        int timeX = pctX + px(42);
+        int timeX = pctX + px(44);
         int timeW = w - timeX - px(6);
         std::wstring timeText;
         COLORREF timeColor = th.dim;
-        if (!wi.valid) {
+        if (!st.valid) {
             timeText = L"—";
+        } else if (st.resetPending) {
+            timeText = L"resetting";
+            timeColor = th.amber;
         } else if (remain > 0) {
             timeText = FormatRemaining(remain, longWindow);
             timeColor = locked ? th.red : th.dim;
@@ -1053,6 +1143,8 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
             timeText = L"reset";
             timeColor = accent;
         }
+        // Log-derived numbers are flagged in the widget, not only in the tooltip.
+        if (u.stale && st.valid) timeText = L"log " + timeText;
         DrawTextAt(mem, timeText, timeX, top, timeW, rowH,
                    locked ? g_fMain : g_fSmall, timeColor, DT_RIGHT | DT_VCENTER);
     };
@@ -1418,12 +1510,19 @@ static void NotifyAvailable(bool weekly) {
 }
 
 static void UpdateTransitionState(const Usage& u) {
-    long long now = (long long)time(nullptr);
+    if (!u.ok) return;                    // no reading: keep the previous state
+    const bool trust = !u.stale;          // only fresh API data may raise events
+    const long long now = (long long)time(nullptr);
     auto step = [&](const WndInfo& w, bool weekly, bool& prevLocked) {
         if (!w.valid) return;
-        bool resetPassed = w.resetAt > 0 && now >= w.resetAt + 2;
-        bool locked = w.used >= 99.5 && !resetPassed;
-        if (!g_havePrev) { prevLocked = locked; return; }
+        LimitState st = EvalLimit(w, now);
+        const bool locked = st.exhausted;
+        // (Re)baseline without emitting events: on the first sample, on every
+        // log-derived (untrustworthy) sample, and when fresh data returns after
+        // a log-derived one. This prevents false "limit reached/available"
+        // toasts built on stale or undated records.
+        if (!g_havePrev || !trust || !g_prevTrust) { prevLocked = locked; return; }
+        if (st.resetPending) return;      // reset not confirmed yet: emit nothing
         if (locked && !prevLocked) NotifyLimit(weekly, w);
         else if (!locked && prevLocked) NotifyAvailable(weekly);
         prevLocked = locked;
@@ -1431,6 +1530,7 @@ static void UpdateTransitionState(const Usage& u) {
     step(u.primary, false, g_prevLockP);
     step(u.secondary, true, g_prevLockS);
     g_havePrev = true;
+    g_prevTrust = trust;
 }
 
 // --------------------------------------------------------------------------
@@ -1441,14 +1541,20 @@ static void UpdateTray() {
     Usage u;
     { std::lock_guard<std::mutex> lk(g_mu); u = g_usage; }
 
+    const long long now = (long long)time(nullptr);
+    const bool remaining = (g_cfg.displayMode == 0);
+    LimitState ps = EvalLimit(u.primary, now);
+    LimitState ss = EvalLimit(u.secondary, now);
+    g_trayResetPending = ps.resetPending;
+
     int pct = 0;
     bool locked = false;
     double usedPct = 0.0;
     Theme th = DetectTheme();
-    if (u.primary.valid) {
-        usedPct = std::max(0.0, std::min(100.0, u.primary.used));
-        locked = usedPct >= 99.5;
-        pct = (int)llround(g_cfg.displayMode == 0 ? 100.0 - usedPct : usedPct);
+    if (ps.valid) {
+        usedPct = ps.usedPct;
+        locked = ps.exhausted;
+        pct = (int)llround(remaining ? 100.0 - usedPct : usedPct);
     }
     COLORREF col = locked ? th.red : (usedPct >= 70.0 ? th.amber : th.green);
 
@@ -1464,23 +1570,38 @@ static void UpdateTray() {
     HICON fallback = LoadIconW(g_inst, MAKEINTRESOURCEW(1));
     nid.hIcon = g_trayIcon ? g_trayIcon : (fallback ? fallback : LoadIconW(nullptr, IDI_APPLICATION));
 
-    long long now = (long long)time(nullptr);
-    const bool remaining = (g_cfg.displayMode == 0);
     std::wstring tip = L"Codex";
+    auto tipRow = [&](const wchar_t* label, const LimitState& s, bool longWindow) {
+        if (!s.valid) return;
+        double shown = remaining ? 100.0 - s.usedPct : s.usedPct;
+        std::wstring pctText = PercentText(shown);
+        if (s.resetPending) pctText = L"~" + pctText;   // assumed after reset
+        tip += std::wstring(L"\n") + label + L": " + pctText;
+        if (s.resetPending) {
+            tip += L" (resetting)";
+        } else {
+            tip += remaining ? L" left, resets in " : L" used, resets in ";
+            tip += FormatRemaining(s.resetInSec > 0 ? s.resetInSec : 0, longWindow);
+        }
+    };
     if (u.ok) {
-        if (u.primary.valid) {
-            long long r = u.primary.resetAt - now;
-            double shown = remaining ? 100.0 - std::max(0.0, std::min(100.0, u.primary.used)) : u.primary.used;
-            tip += L"\n5h: " + PercentText(shown) + (remaining ? L" left, resets in " : L" used, resets in ") +
-                   FormatRemaining(r > 0 ? r : 0, false);
+        tipRow(L"5h", ps, false);
+        tipRow(L"wk", ss, true);
+        if (u.stale) {
+            // Clearly mark fallback data and how old (or how undated) it is.
+            tip += L"\n(from session log";
+            if (u.sampleAt > 0) {
+                long long age = now - u.sampleAt;
+                if (age < 0) age = 0;
+                if (age < 60) tip += L", just now";
+                else tip += L", " + FormatRemaining(age, age >= 86400) + L" old";
+            } else {
+                tip += L", age unknown";
+            }
+            tip += L")";
+        } else if (ps.resetPending || ss.resetPending) {
+            tip += L"\n(awaiting fresh data after reset)";
         }
-        if (u.secondary.valid) {
-            long long r = u.secondary.resetAt - now;
-            double shown = remaining ? 100.0 - std::max(0.0, std::min(100.0, u.secondary.used)) : u.secondary.used;
-            tip += L"\nwk: " + PercentText(shown) + (remaining ? L" left, resets in " : L" used, resets in ") +
-                   FormatRemaining(r > 0 ? r : 0, true);
-        }
-        if (u.stale) tip += L"\n(from session log)";
     } else {
         tip += L"\n" + (u.error.empty() ? std::wstring(L"no data") : u.error);
     }
@@ -1520,19 +1641,43 @@ static void ScheduleNextPoll(const Usage& u) {
     g_nextPollDue = GetTickCount64() + (ULONGLONG)delayMs;
 }
 
+// Stops the in-flight worker, if any, and waits for it. Called while shutting
+// down. WinHTTP cannot safely abort a synchronous request from another thread,
+// so the wait is bounded by the HTTP timeouts set in HttpGet().
+static void StopFetchWorker() {
+    g_shutdown.store(true);
+    if (g_fetchThread.joinable()) g_fetchThread.join();
+}
+
 static void RequestRefresh() {
-    if (g_fetching) return;
-    g_fetching = true;
+    if (g_shutdown.load()) return;
+    // Claim the single in-flight slot atomically, so rapid refreshes cannot
+    // start a second request.
+    bool expected = false;
+    if (!g_fetching.compare_exchange_strong(expected, true)) return;
+
+    // The previous worker already cleared g_fetching; reap its thread object
+    // before reusing the slot.
+    if (g_fetchThread.joinable()) g_fetchThread.join();
+
     HWND anchor = g_anchor;
-    std::thread([anchor]() {
-        Usage u = FetchUsage();
-        {
-            std::lock_guard<std::mutex> lk(g_mu);
-            g_usage = u;
-        }
-        g_fetching = false;
-        if (anchor) PostMessageW(anchor, WM_REFRESHED, 0, 0);
-    }).detach();
+    try {
+        g_fetchThread = std::thread([anchor]() {
+            Usage u = FetchUsage();
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_usage = u;
+            }
+            // Never touch the window after shutdown begins. StopFetchWorker()
+            // joins this thread before the anchor is destroyed, so the HWND
+            // cannot have been recycled for a different window either.
+            if (!g_shutdown.load() && anchor) PostMessageW(anchor, WM_REFRESHED, 0, 0);
+            g_fetching.store(false);
+        });
+    } catch (...) {
+        // Thread creation failed: release the slot so a later refresh can retry.
+        g_fetching.store(false);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -1731,6 +1876,15 @@ static LRESULT CALLBACK AnchorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SampleBackground(wr);
                 InvalidateRect(g_widget, nullptr, FALSE);
             }
+            // A window can roll over between polls; update the tray icon and
+            // tooltip the moment that happens so they cannot disagree with the
+            // widget. Between rollovers the tray is left untouched.
+            {
+                Usage u;
+                { std::lock_guard<std::mutex> lk(g_mu); u = g_usage; }
+                bool pending = EvalLimit(u.primary, (long long)time(nullptr)).resetPending;
+                if (pending != g_trayResetPending) UpdateTray();
+            }
             if (g_nextPollDue == 0 || GetTickCount64() >= g_nextPollDue) {
                 g_nextPollDue = GetTickCount64() + 15000;
                 RequestRefresh();
@@ -1772,6 +1926,7 @@ static LRESULT CALLBACK AnchorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_DESTROY: {
+            StopFetchWorker();
             KillTimer(hwnd, TID_TICK);
             NOTIFYICONDATAW nid{};
             nid.cbSize = sizeof(nid);
@@ -1915,6 +2070,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    StopFetchWorker();   // no-op if WM_DESTROY already stopped it
     if (singleMutex) CloseHandle(singleMutex);
     return 0;
 }
