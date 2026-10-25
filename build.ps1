@@ -2,6 +2,9 @@
 # Static CRT (/MT), no external dependencies: one self-contained exe.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File build.ps1
+# Tests:  powershell -ExecutionPolicy Bypass -File build.ps1 -Test
+
+param([switch]$Test)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -37,3 +40,16 @@ Invoke-Vc ("cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE " +
 $exe = Get-Item "$root\build\CodexTaskbar.exe"
 Write-Output ("built: {0} ({1:N0} bytes)" -f $exe.FullName, $exe.Length)
 Write-Output ("description: {0}" -f $exe.VersionInfo.FileDescription)
+
+if ($Test) {
+    Invoke-Vc ("cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE " +
+               "tests\UsageTests.cpp /Fo:build\UsageTests.obj /Fe:build\UsageTests.exe " +
+               "/link /SUBSYSTEM:CONSOLE") "compile tests"
+    & "$root\build\UsageTests.exe"
+    if ($LASTEXITCODE -ne 0) { Write-Error "usage tests failed (exit $LASTEXITCODE)" }
+    Invoke-Vc ("cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE " +
+               "tests\TooltipTests.cpp /Fo:build\TooltipTests.obj /Fe:build\TooltipTests.exe " +
+               "/link /SUBSYSTEM:CONSOLE /MANIFEST:EMBED /MANIFESTINPUT:src\app.manifest") "compile tooltip tests"
+    & "$root\build\TooltipTests.exe"
+    if ($LASTEXITCODE -ne 0) { Write-Error "tooltip tests failed (exit $LASTEXITCODE)" }
+}

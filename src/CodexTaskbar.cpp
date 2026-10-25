@@ -26,6 +26,7 @@
 #include <winhttp.h>
 #include <mmsystem.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <string>
 #include <vector>
 #include <utility>
@@ -47,6 +48,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "comctl32.lib")
 
 // --------------------------------------------------------------------------
 //  Helpers
@@ -251,10 +253,11 @@ struct WndInfo {
 
 struct Usage {
     bool ok = false;
-    WndInfo primary;          // 5-hour window
-    WndInfo secondary;        // weekly window
+    WndInfo shortWindow;      // normally 5 hours; normalized by duration, not API position
+    WndInfo weeklyWindow;     // may arrive as primary, with no short window on some plans
     bool limitReached = false;
     bool stale = false;
+    std::wstring planType;    // API plan_type; never inferred from the limit windows
     std::wstring source;
     std::wstring error;
     long long fetchedAt = 0;  // when this reading was performed
@@ -299,6 +302,8 @@ enum MenuId {
 static HINSTANCE g_inst = nullptr;
 static HWND g_anchor = nullptr;      // hidden owner of tray icon + timers
 static HWND g_widget = nullptr;      // visible widget
+static HWND g_widgetTooltip = nullptr;
+static std::wstring g_widgetTipText;  // owns the callback text while the tooltip displays it
 static HWND g_taskbar = nullptr;     // taskbar currently hosting the widget
 static bool g_attached = false;
 static bool g_havePrev = false;
@@ -324,7 +329,7 @@ static Config g_cfg;
 static HFONT g_fMain = nullptr, g_fSmall = nullptr, g_fTiny = nullptr;
 static HICON g_trayIcon = nullptr;
 static bool  g_trayAdded = false;
-static bool  g_trayResetPending = false;   // last reset-pending state shown in the tray
+static unsigned g_trayResetMask = 0;       // last reset-pending state of both windows
 static int   g_fontDpi = 0;
 static int   g_fontQuality = CLEARTYPE_QUALITY;
 static int   g_bgEffective = 1;   // runtime background mode after capability fallback
@@ -693,9 +698,12 @@ static HttpResp HttpGet(const std::wstring& host, const std::wstring& path,
 }
 
 static void FillWindow(const JVal* w, WndInfo& out, long long defaultWindowSec, bool minutesField) {
+    out = {};
     if (!w || w->t != JVal::Obj) return;
     const JVal* up = w->Get("used_percent");
-    const JVal* ra = w->Get("reset_at");
+    const JVal* ra = w->Get(minutesField ? "resets_at" : "reset_at");
+    // Older session logs used the API spelling.
+    if (minutesField && (!ra || ra->t != JVal::Num)) ra = w->Get("reset_at");
     if (!up || up->t != JVal::Num || !ra || ra->t != JVal::Num) return;
     out.valid = true;
     out.used = up->num;
@@ -703,11 +711,58 @@ static void FillWindow(const JVal* w, WndInfo& out, long long defaultWindowSec, 
     out.windowSec = defaultWindowSec;
     if (minutesField) {
         if (const JVal* m = w->Get("window_minutes"))
-            if (m->t == JVal::Num) out.windowSec = (long long)(m->num * 60.0);
+            if (m->t == JVal::Num && m->num >= 1) out.windowSec = (long long)(m->num * 60.0);
     } else {
         if (const JVal* s = w->Get("limit_window_seconds"))
-            if (s->t == JVal::Num) out.windowSec = (long long)s->num;
+            if (s->t == JVal::Num && s->num >= 1) out.windowSec = (long long)s->num;
     }
+}
+
+// primary/secondary describe API positions, not fixed time periods. In
+// particular, a weekly-only plan supplies its week in primary and null secondary.
+// Keep the rest of the app independent of those positions (including log fallback).
+static void ReadUsageWindows(const JVal& rl, Usage& u, bool minutesField) {
+    WndInfo primary, secondary;
+    FillWindow(rl.Get(minutesField ? "primary" : "primary_window"), primary, 18000, minutesField);
+    FillWindow(rl.Get(minutesField ? "secondary" : "secondary_window"), secondary, 604800, minutesField);
+    u.shortWindow = {};
+    u.weeklyWindow = {};
+    for (const WndInfo& w : { primary, secondary }) {
+        if (!w.valid) continue;
+        WndInfo& slot = w.windowSec >= 86400 ? u.weeklyWindow : u.shortWindow;
+        if (!slot.valid) slot = w;
+    }
+}
+
+static const WndInfo& MainWindow(const Usage& u) {
+    return u.shortWindow.valid ? u.shortWindow : u.weeklyWindow;
+}
+
+static bool ShowWeeklyRow(const Usage& u, bool showWeekly) {
+    // The only available limit always stays visible, even if the optional
+    // weekly row was hidden while using a plan with two windows.
+    return showWeekly && u.shortWindow.valid && u.weeklyWindow.valid;
+}
+
+static std::wstring ReadPlanType(const JVal& v) {
+    const JVal* plan = v.Get("plan_type");
+    if (!plan || plan->t != JVal::Str) return {};
+    std::wstring value = U82W(plan->str);
+    value.erase(std::remove_if(value.begin(), value.end(), [](wchar_t c) { return c <= L' '; }), value.end());
+    return value;
+}
+
+static bool ReadApiUsage(const JVal& root, Usage& u) {
+    u.planType = ReadPlanType(root);
+    u.shortWindow = {};
+    u.weeklyWindow = {};
+    u.limitReached = false;
+    if (const JVal* rl = root.Get("rate_limit")) {
+        ReadUsageWindows(*rl, u, false);
+        if (const JVal* lr = rl->Get("limit_reached"))
+            u.limitReached = (lr->t == JVal::Bool && lr->b);
+    }
+    return u.shortWindow.valid || u.weeklyWindow.valid;
 }
 
 static std::wstring NewestRollout() {
@@ -773,6 +828,29 @@ static long long RecordTimestamp(const JVal& v) {
     return 0;
 }
 
+static bool ReadRolloutUsage(const JVal& v, Usage& u) {
+    const JVal* payload = v.Get("payload");
+    if (!payload) return false;
+    const JVal* rl = payload->Get("rate_limits");
+    if (!rl || rl->t != JVal::Obj) return false;
+    // Other model buckets (e.g. Spark) are not the account's Codex limits.
+    if (const JVal* id = rl->Get("limit_id"))
+        if (id->t == JVal::Str && id->str != "codex") return false;
+    Usage parsed;
+    parsed.planType = ReadPlanType(*rl);
+    ReadUsageWindows(*rl, parsed, true);
+    if (!parsed.shortWindow.valid && !parsed.weeklyWindow.valid) return false;
+    parsed.stale = true;
+    parsed.source = L"Codex session log";
+    parsed.ok = true;
+    parsed.fetchedAt = (long long)time(nullptr);
+    // The percentage belongs to the record's timestamp, not its file's mtime.
+    parsed.sampleAt = RecordTimestamp(v);
+    if (parsed.sampleAt == 0) parsed.sampleAt = RecordTimestamp(*payload);
+    u = std::move(parsed);
+    return true;
+}
+
 static bool LoadFromRollout(Usage& u) {
     std::wstring file = NewestRollout();
     if (file.empty()) return false;
@@ -792,25 +870,7 @@ static bool LoadFromRollout(Usage& u) {
         JVal v;
         JParser p(line.c_str(), line.c_str() + line.size());
         if (!p.Parse(v)) continue;
-        const JVal* payload = v.Get("payload");
-        if (!payload) continue;
-        const JVal* rl = payload->Get("rate_limits");
-        if (!rl || rl->t != JVal::Obj) continue;
-        WndInfo pri, sec;
-        FillWindow(rl->Get("primary"), pri, 18000, true);
-        FillWindow(rl->Get("secondary"), sec, 604800, true);
-        if (!pri.valid && !sec.valid) continue;
-        u.primary = pri;
-        u.secondary = sec;
-        u.stale = true;
-        u.source = L"Codex session log";
-        u.ok = true;
-        u.fetchedAt = (long long)time(nullptr);
-        // The percentage belongs to the moment the record was written, not to
-        // the moment we read it; 0 means the record carries no usable time.
-        u.sampleAt = RecordTimestamp(v);
-        if (u.sampleAt == 0) u.sampleAt = RecordTimestamp(*payload);
-        return true;
+        if (ReadRolloutUsage(v, u)) return true;
     }
     return false;
 }
@@ -830,13 +890,7 @@ static Usage FetchUsage() {
             JVal root;
             JParser p(r.body.c_str(), r.body.c_str() + r.body.size());
             if (p.Parse(root)) {
-                if (const JVal* rl = root.Get("rate_limit")) {
-                    FillWindow(rl->Get("primary_window"), u.primary, 18000, false);
-                    FillWindow(rl->Get("secondary_window"), u.secondary, 604800, false);
-                    if (const JVal* lr = rl->Get("limit_reached"))
-                        u.limitReached = (lr->t == JVal::Bool && lr->b);
-                }
-                if (u.primary.valid || u.secondary.valid) {
+                if (ReadApiUsage(root, u)) {
                     u.ok = true;
                     u.source = L"API Codex";
                     u.fetchedAt = (long long)time(nullptr);
@@ -897,6 +951,17 @@ static std::wstring PercentText(double pct) {
     return b;
 }
 
+static bool IsLongWindow(const WndInfo& w) {
+    return w.windowSec >= 86400;
+}
+
+static std::wstring WindowLabel(const WndInfo& w) {
+    if (w.windowSec == 604800) return L"wk";
+    if (IsLongWindow(w)) return std::to_wstring(w.windowSec / 86400) + L"d";
+    if (w.windowSec >= 3600) return std::to_wstring(w.windowSec / 3600) + L"h";
+    return std::to_wstring(w.windowSec / 60) + L"m";
+}
+
 // The single authoritative view of a limit window. The widget, the tray icon,
 // the tooltip and the notification logic all derive from this, so they can never
 // disagree about the percentage, severity, reset time or confidence.
@@ -929,6 +994,52 @@ static LimitState EvalLimit(const WndInfo& w, long long now) {
         s.exhausted = s.usedPct >= 99.5;
     }
     return s;
+}
+
+static unsigned TrayResetMask(const Usage& u, long long now) {
+    return (EvalLimit(u.shortWindow, now).resetPending ? 1u : 0u)
+         | (EvalLimit(u.weeklyWindow, now).resetPending ? 2u : 0u);
+}
+
+static std::wstring PlanName(const std::wstring& plan) {
+    if (plan.empty()) return L"Unknown";
+    if (plan == L"free") return L"Free";
+    if (plan == L"plus") return L"Plus";
+    if (plan == L"pro") return L"Pro";
+    if (plan == L"prolite") return L"Pro Lite";
+    if (plan == L"team") return L"Team";
+    if (plan == L"business") return L"Business";
+    if (plan == L"enterprise") return L"Enterprise";
+    if (plan == L"edu") return L"Edu";
+    if (plan == L"go") return L"Go";
+    // Preserve new plan identifiers rather than misclassifying them as Plus/Pro.
+    return plan.size() <= 24 ? plan : plan.substr(0, 23) + L"…";
+}
+
+// Shared by the tray and the widget. Compact wording leaves room for the plan
+// and the source/confidence within the tray's 127-character tooltip limit.
+static std::wstring UsageTooltip(const Usage& u, long long now, bool remaining) {
+    std::wstring tip = L"Codex | Plan: " + PlanName(u.planType);
+    if (u.stale) {
+        tip += L"\nSession log (";
+        if (u.sampleAt <= 0) tip += L"age unknown";
+        else {
+            long long age = std::max(0LL, now - u.sampleAt);
+            tip += age < 60 ? L"just now" : FormatRemaining(age, age >= 86400) + L" old";
+        }
+        tip += L")";
+    }
+    if (!u.ok) return tip + L"\n" + (u.error.empty() ? L"no data" : u.error);
+    for (const WndInfo& w : {u.shortWindow, u.weeklyWindow}) {
+        LimitState state = EvalLimit(w, now);
+        if (!state.valid) continue;
+        tip += L"\n" + WindowLabel(w) + L": ";
+        if (state.resetPending) tip += L"~";
+        tip += PercentText(remaining ? 100.0 - state.usedPct : state.usedPct);
+        tip += remaining ? L" left" : L" used";
+        tip += state.resetPending ? L", resetting" : L", reset " + FormatRemaining(state.resetInSec, IsLongWindow(w));
+    }
+    return tip;
 }
 
 static void EnsureFonts(int dpi, int quality = CLEARTYPE_QUALITY) {
@@ -1073,7 +1184,7 @@ static void FillBackground(HDC dc, int w, int h, const Theme& th) {
 
 // Draws only the content; the caller has already filled the background.
 static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) {
-    const int rows = g_cfg.showWeekly ? 2 : 1;
+    const int rows = ShowWeeklyRow(u, g_cfg.showWeekly) ? 2 : 1;
     const int rowH = h / rows;
     auto px = [&](int v) { return MulDiv(v, g_dpi, 96); };
 
@@ -1159,16 +1270,10 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
                    locked ? g_fMain : g_fSmall, timeColor, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
     };
 
-    int hours = u.primary.windowSec > 0 ? (int)(u.primary.windowSec / 3600) : 5;
-    wchar_t lbl[16];
-    swprintf_s(lbl, L"%dh", hours);
-    drawRow(0, lbl, u.primary, false);
-
-    if (g_cfg.showWeekly) {
-        long long days = u.secondary.windowSec > 0 ? u.secondary.windowSec / 86400 : 7;
-        std::wstring wl = days >= 7 ? std::wstring(L"wk") : (std::to_wstring(days) + L"d");
-        drawRow(1, wl, u.secondary, true);
-    }
+    const WndInfo& main = MainWindow(u);
+    drawRow(0, WindowLabel(main), main, IsLongWindow(main));
+    if (rows == 2)
+        drawRow(1, WindowLabel(u.weeklyWindow), u.weeklyWindow, true);
 }
 
 // Renders the widget: opaque auto-sampled background, transparent color key,
@@ -1346,7 +1451,41 @@ static RECT TargetRect(HWND tb) {
     return out;
 }
 
+static void DestroyWidgetTooltip() {
+    if (g_widgetTooltip) DestroyWindow(g_widgetTooltip);
+    g_widgetTooltip = nullptr;
+    g_widgetTipText.clear();
+}
+
+static void CreateWidgetTooltip() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES};
+    if (!InitCommonControlsEx(&controls)) return;
+    g_widgetTooltip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        g_anchor, nullptr, g_inst, nullptr);
+    if (!g_widgetTooltip) return;
+    TOOLINFOW tool{};
+    tool.cbSize = sizeof(tool);
+    tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    tool.hwnd = g_widget;
+    tool.uId = (UINT_PTR)g_widget;
+    tool.lpszText = LPSTR_TEXTCALLBACKW;
+    if (!SendMessageW(g_widgetTooltip, TTM_ADDTOOLW, 0, (LPARAM)&tool)) {
+        DestroyWidgetTooltip();
+        return;
+    }
+    SendMessageW(g_widgetTooltip, TTM_SETMAXTIPWIDTH, 0, MulDiv(360, g_dpi, 96));
+    SendMessageW(g_widgetTooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 500);
+    SendMessageW(g_widgetTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 15000);
+}
+
+static void RefreshWidgetTooltip() {
+    if (g_widgetTooltip && IsWindowVisible(g_widgetTooltip))
+        SendMessageW(g_widgetTooltip, TTM_UPDATE, 0, 0);
+}
+
 static void DestroyWidget() {
+    DestroyWidgetTooltip();
     if (g_widget) {
         HWND w = g_widget;
         g_widget = nullptr;
@@ -1361,6 +1500,7 @@ static void CreateWidget() {
     g_widget = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kWidgetClass, L"",
                                WS_POPUP, 0, 0, MulDiv(kWidgetW, 96, 96), 40,
                                nullptr, nullptr, g_inst, nullptr);
+    if (g_widget) CreateWidgetTooltip();
 }
 
 static void ApplyBackgroundStyle() {
@@ -1397,6 +1537,8 @@ static void ApplyPlacement() {
     RECT target = TargetRect(tb);
     UINT dpi = tb ? GetDpiForWindow(tb) : 96;
     g_dpi = (dpi >= 96 && dpi <= 480) ? (int)dpi : 96;
+    if (g_widgetTooltip)
+        SendMessageW(g_widgetTooltip, TTM_SETMAXTIPWIDTH, 0, MulDiv(360, g_dpi, 96));
 
     if (g_cfg.placement == 0 && tb) {
         if (GetParent(g_widget) != tb) {
@@ -1537,8 +1679,8 @@ static void UpdateTransitionState(const Usage& u) {
         else if (!locked && prevLocked) NotifyAvailable(weekly);
         prevLocked = locked;
     };
-    step(u.primary, false, g_prevLockP);
-    step(u.secondary, true, g_prevLockS);
+    step(u.shortWindow, false, g_prevLockP);
+    step(u.weeklyWindow, true, g_prevLockS);
     g_havePrev = true;
     g_prevTrust = trust;
 }
@@ -1553,17 +1695,16 @@ static void UpdateTray() {
 
     const long long now = (long long)time(nullptr);
     const bool remaining = (g_cfg.displayMode == 0);
-    LimitState ps = EvalLimit(u.primary, now);
-    LimitState ss = EvalLimit(u.secondary, now);
-    g_trayResetPending = ps.resetPending;
+    LimitState main = EvalLimit(MainWindow(u), now);
+    g_trayResetMask = TrayResetMask(u, now);
 
     int pct = 0;
     bool locked = false;
     double usedPct = 0.0;
     Theme th = DetectTheme();
-    if (ps.valid) {
-        usedPct = ps.usedPct;
-        locked = ps.exhausted;
+    if (main.valid) {
+        usedPct = main.usedPct;
+        locked = main.exhausted;
         pct = (int)llround(remaining ? 100.0 - usedPct : usedPct);
     }
     COLORREF col = locked ? th.red : (usedPct >= 70.0 ? th.amber : th.green);
@@ -1575,46 +1716,12 @@ static void UpdateTray() {
     nid.cbSize = sizeof(nid);
     nid.hWnd = g_anchor;
     nid.uID = kTrayId;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = WM_TRAY;
     HICON fallback = LoadIconW(g_inst, MAKEINTRESOURCEW(1));
     nid.hIcon = g_trayIcon ? g_trayIcon : (fallback ? fallback : LoadIconW(nullptr, IDI_APPLICATION));
 
-    std::wstring tip = L"Codex";
-    auto tipRow = [&](const wchar_t* label, const LimitState& s, bool longWindow) {
-        if (!s.valid) return;
-        double shown = remaining ? 100.0 - s.usedPct : s.usedPct;
-        std::wstring pctText = PercentText(shown);
-        if (s.resetPending) pctText = L"~" + pctText;   // assumed after reset
-        tip += std::wstring(L"\n") + label + L": " + pctText;
-        if (s.resetPending) {
-            tip += L" (resetting)";
-        } else {
-            tip += remaining ? L" left, resets in " : L" used, resets in ";
-            tip += FormatRemaining(s.resetInSec > 0 ? s.resetInSec : 0, longWindow);
-        }
-    };
-    if (u.ok) {
-        tipRow(L"5h", ps, false);
-        tipRow(L"wk", ss, true);
-        if (u.stale) {
-            // Clearly mark fallback data and how old (or how undated) it is.
-            tip += L"\n(from session log";
-            if (u.sampleAt > 0) {
-                long long age = now - u.sampleAt;
-                if (age < 0) age = 0;
-                if (age < 60) tip += L", just now";
-                else tip += L", " + FormatRemaining(age, age >= 86400) + L" old";
-            } else {
-                tip += L", age unknown";
-            }
-            tip += L")";
-        } else if (ps.resetPending || ss.resetPending) {
-            tip += L"\n(awaiting fresh data after reset)";
-        }
-    } else {
-        tip += L"\n" + (u.error.empty() ? std::wstring(L"no data") : u.error);
-    }
+    std::wstring tip = UsageTooltip(u, now, remaining);
     wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
 
     if (!g_trayAdded) {
@@ -1627,6 +1734,7 @@ static void UpdateTray() {
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
     if (old && old != g_trayIcon) DestroyIcon(old);
+    RefreshWidgetTooltip();
 }
 
 // --------------------------------------------------------------------------
@@ -1644,8 +1752,8 @@ static void ScheduleNextPoll(const Usage& u) {
             long long ms = (w.resetAt - now + 3) * 1000;
             if (ms > 0 && (best == 0 || ms < best)) best = ms;
         };
-        consider(u.primary);
-        consider(u.secondary);
+        consider(u.shortWindow);
+        consider(u.weeklyWindow);
         if (best > 0 && best < delayMs) delayMs = std::max<long long>(best, 5000);
     }
     g_nextPollDue = GetTickCount64() + (ULONGLONG)delayMs;
@@ -1745,7 +1853,9 @@ static void ShowMenu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_cfg.notify ? MF_CHECKED : 0), ID_NOTIFY, L"Notifications");
     AppendMenuW(m, MF_STRING | (g_cfg.sound ? MF_CHECKED : 0), ID_SOUND, L"Sound alerts");
-    AppendMenuW(m, MF_STRING | (g_cfg.showWeekly ? MF_CHECKED : 0), ID_WEEKLY, L"Show weekly limit");
+    const bool weeklyOnly = u.weeklyWindow.valid && !u.shortWindow.valid;
+    AppendMenuW(m, MF_STRING | ((g_cfg.showWeekly || weeklyOnly) ? MF_CHECKED : 0)
+                | (weeklyOnly ? MF_GRAYED : 0), ID_WEEKLY, L"Show weekly limit");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)interval, L"Refresh interval");
     AppendMenuW(m, MF_STRING | (IsAutostart() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1809,7 +1919,7 @@ static void ShowMenu() {
 }
 
 // --------------------------------------------------------------------------
-//  Widget window proc (painting only)
+//  Widget window proc (painting and tooltip)
 // --------------------------------------------------------------------------
 static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -1828,12 +1938,27 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 1;
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
+        case WM_NOTIFY: {
+            NMHDR* hdr = reinterpret_cast<NMHDR*>(lp);
+            if (hdr && hdr->hwndFrom == g_widgetTooltip && hdr->code == TTN_GETDISPINFOW) {
+                Usage u;
+                { std::lock_guard<std::mutex> lk(g_mu); u = g_usage; }
+                g_widgetTipText = UsageTooltip(u, (long long)time(nullptr), g_cfg.displayMode == 0);
+                reinterpret_cast<NMTTDISPINFOW*>(lp)->lpszText = g_widgetTipText.data();
+                return 0;
+            }
+            break;
+        }
         case WM_LBUTTONUP:
         case WM_RBUTTONUP:
+            if (g_widgetTooltip) SendMessageW(g_widgetTooltip, TTM_POP, 0, 0);
             if (g_anchor) PostMessageW(g_anchor, WM_TRAY, 0, MAKELPARAM(WM_RBUTTONUP, kTrayId));
             return 0;
         case WM_NCHITTEST:
             return HTCLIENT;
+        case WM_DESTROY:
+            DestroyWidgetTooltip();
+            return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -1880,6 +2005,7 @@ static LRESULT CALLBACK AnchorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             WatchdogTick();
+            RefreshWidgetTooltip();
             if (g_widget && IsWindow(g_widget)) {
                 RECT wr{};
                 GetWindowRect(g_widget, &wr);
@@ -1892,8 +2018,8 @@ static LRESULT CALLBACK AnchorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             {
                 Usage u;
                 { std::lock_guard<std::mutex> lk(g_mu); u = g_usage; }
-                bool pending = EvalLimit(u.primary, (long long)time(nullptr)).resetPending;
-                if (pending != g_trayResetPending) UpdateTray();
+                unsigned pending = TrayResetMask(u, (long long)time(nullptr));
+                if (pending != g_trayResetMask) UpdateTray();
             }
             if (g_nextPollDue == 0 || GetTickCount64() >= g_nextPollDue) {
                 g_nextPollDue = GetTickCount64() + 15000;
@@ -1994,12 +2120,14 @@ static int RunDump() {
 
     swprintf_s(buf,
         L"ok=%d stale=%d source=%s error=%s\r\n"
-        L"primary: valid=%d used=%.2f resetAt=%lld window=%lld\r\n"
-        L"secondary: valid=%d used=%.2f resetAt=%lld window=%lld\r\n"
+        L"plan=%s\r\n"
+        L"short: valid=%d used=%.2f resetAt=%lld window=%lld\r\n"
+        L"weekly: valid=%d used=%.2f resetAt=%lld window=%lld\r\n"
         L"now=%lld\r\n",
         (int)u.ok, (int)u.stale, u.source.c_str(), u.error.c_str(),
-        (int)u.primary.valid, u.primary.used, u.primary.resetAt, u.primary.windowSec,
-        (int)u.secondary.valid, u.secondary.used, u.secondary.resetAt, u.secondary.windowSec,
+        u.planType.c_str(),
+        (int)u.shortWindow.valid, u.shortWindow.used, u.shortWindow.resetAt, u.shortWindow.windowSec,
+        (int)u.weeklyWindow.valid, u.weeklyWindow.used, u.weeklyWindow.resetAt, u.weeklyWindow.windowSec,
         (long long)time(nullptr));
     std::wstring out = buf;
     out += L"\r\n";

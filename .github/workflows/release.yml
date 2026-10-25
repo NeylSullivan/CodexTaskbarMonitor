@@ -16,10 +16,10 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Build x64 executable
+      - name: Build and test x64 executable
         shell: pwsh
         run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path 'build/CodexTaskbar.exe')) {
             throw 'Build finished without build/CodexTaskbar.exe'

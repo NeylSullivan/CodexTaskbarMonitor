@@ -5,6 +5,10 @@ A lightweight native widget that lives **inside the Windows taskbar** and shows 
 exact time until each reset, plus notifications (and sounds) when a limit is exhausted
 and when it becomes available again.
 
+Plans with only a weekly limit show a single `wk` row, with the countdown in days and
+hours. The tray icon also follows that weekly limit. Window types are detected from
+their duration, so the weekly limit is recognized even when the API returns it first.
+
 Inspired by [Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
 but Codex-only, dependency-free, and with taskbar hosting that behaves properly on Windows 10.
 
@@ -20,9 +24,10 @@ but Codex-only, dependency-free, and with taskbar hosting that behaves properly 
 | Seamless background | transparent by default (color-key, no painted background at all); two alternatives available |
 | Notifications | Windows toast when a limit is exhausted and when it becomes available again |
 | Sound | synthesized cues: descending tones for "limit reached", rising arpeggio for "available again" |
-| Tray icon | progress ring colored by state, tooltip with both windows |
+| Tray icon | progress ring colored by state, tooltip with the plan and available windows |
+| Hover details | the tray icon and widget show the plan, percentages, reset countdowns and session-log age |
 | Menu | right-click the widget, or left/right-click the tray icon |
-| Settings | refresh interval, notifications, sound, weekly row, display direction, placement mode, monitor, autostart |
+| Settings | refresh interval, notifications, sound, optional weekly row on plans with two windows, display direction, placement mode, monitor, autostart |
 | Resilience | widget is recreated after an `explorer.exe` restart; position and DPI re-checked every second |
 | Footprint | one ~310 KB exe, ~3 MB private memory, no .NET, no VC++ Redistributable |
 
@@ -65,6 +70,11 @@ Two modes, switchable from **Display** in the menu:
 The bar, the percentage, the tray ring and the tooltip all follow the selected mode.
 Severity colors (green → amber ≥ 70% used → red when exhausted) are derived from actual
 consumption, so `Remaining` still turns red when nothing is left.
+
+Hover over the tray icon or the widget's text/bar to see the account plan, for example
+`Codex | Plan: Plus` or `Codex | Plan: Pro Lite`. The plan comes from `plan_type` in the
+usage response (or session log), independently of the window lengths. Unknown plan
+identifiers are shown as supplied; if the field is missing, the tooltip says `Unknown`.
 
 Stored as `display_mode` in the config file (`0` = remaining, `1` = used).
 
@@ -113,7 +123,7 @@ Stored in `%APPDATA%\CodexTaskbar\config.ini`:
 refresh_sec=60      ; API poll interval in seconds (minimum 15)
 notify=1            ; toast notifications
 sound=1             ; sound cues
-show_weekly=1       ; second row with the weekly window
+show_weekly=1       ; optional weekly row; a sole weekly limit always stays visible
 display_mode=0      ; 0 = remaining (default), 1 = used
 background=1        ; 0 = auto (mirror taskbar), 1 = transparent (default), 2 = solid
 placement=0         ; 0 = in taskbar, 1 = above taskbar, 2 = tray icon only
@@ -147,14 +157,22 @@ This is the most fragile part of such apps, so several safeguards exist:
    `GET https://chatgpt.com/backend-api/wham/usage` with
    `Authorization: Bearer <access_token>`, `ChatGPT-Account-Id: <account_id>` and
    `User-Agent: codex-cli`. The token is read from `auth.json` and never written anywhere.
-   The app reads `rate_limit.primary_window` (5 hours, `limit_window_seconds = 18000`) and
-   `rate_limit.secondary_window` (weekly, `604800`).
+   The app reads `rate_limit.primary_window` and `rate_limit.secondary_window` and maps
+   them by `limit_window_seconds`: normally 5 hours (`18000`) and a week (`604800`).
+   Their positions are not fixed: a weekly-only plan can return the week as
+   `primary_window` and `null` as `secondary_window`. Missing windows are omitted.
+   For older responses without a positive duration, the original positional defaults
+   (5 hours / 1 week) are retained.
 
 2. **Fallback** — the local Codex session log
    (`%USERPROFILE%\.codex\sessions\**\rollout-*.jsonl`, last `rate_limits` entry). Used
    automatically when the API is unreachable or the token expired. In that case the menu and
    the tooltip say `Source: Codex session log` and the numbers only advance while you work in
-   the Codex CLI.
+   the Codex CLI. The app maps `window_minutes` by duration and accepts both `resets_at`
+   and the older `reset_at` spelling, ignoring other model-specific limit buckets.
+
+**Show weekly limit** controls the extra row on plans with two limits. On a weekly-only
+plan the sole limit remains visible and this menu option is checked and disabled.
 
 If `auth.json` is missing or the token is stale, the widget shows *"Sign in to Codex CLI"* —
 just run `codex` and sign in.
@@ -171,6 +189,18 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 The script locates `vcvars64.bat`, compiles resources (`src/app.rc`: icon + version info) and
 links `build\CodexTaskbar.exe` against the static CRT (`/MT`), so the exe needs neither .NET
 nor the VC++ Redistributable.
+
+To build and run the offline regression tests:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1 -Test
+```
+
+Tests cover two-window and weekly-only responses, swapped window positions, session-log
+formats, missing windows, countdowns, plan tooltips and tray reset state. A Windows
+control test also checks widget tooltip callbacks and cleanup using hidden windows.
+Tests do not read credentials, call the API, or display notifications. Release builds
+run these tests before publishing.
 
 ```
 src/CodexTaskbar.cpp   ~1700 lines: WinHTTP client, JSON parser, GDI rendering, widget,
