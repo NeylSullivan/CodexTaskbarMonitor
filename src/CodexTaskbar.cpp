@@ -27,6 +27,7 @@
 #include <mmsystem.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include "app_version.h"
 #include <string>
 #include <vector>
 #include <utility>
@@ -281,6 +282,7 @@ struct Config {
 // --------------------------------------------------------------------------
 static const wchar_t* kWidgetClass = L"CodexTaskbarWidget_v1";
 static const wchar_t* kAnchorClass = L"CodexTaskbarAnchor_v1";
+static const wchar_t* kReleasesUrl = L"https://github.com/NeylSullivan/CodexTaskbarMonitor/releases";
 static const int kWidgetW = 208;
 
 static const UINT WM_TRAY      = WM_APP + 1;
@@ -296,6 +298,7 @@ enum MenuId {
     ID_INT_30, ID_INT_60, ID_INT_120, ID_INT_300, ID_EXIT,
     ID_MODE_REMAINING, ID_MODE_USED,
     ID_BG_AUTO, ID_BG_TRANSPARENT, ID_BG_SOLID,
+    ID_ABOUT,
     ID_MON_BASE = 300
 };
 
@@ -329,7 +332,10 @@ static Config g_cfg;
 static HFONT g_fMain = nullptr, g_fSmall = nullptr, g_fTiny = nullptr;
 static HICON g_trayIcon = nullptr;
 static bool  g_trayAdded = false;
-static unsigned g_trayResetMask = 0;       // last reset-pending state of both windows
+static int g_trayPercent = -1;
+static COLORREF g_trayColor = 0;
+static bool g_trayLocked = false;
+static std::wstring g_trayTipText;
 static int   g_fontDpi = 0;
 static int   g_fontQuality = CLEARTYPE_QUALITY;
 static int   g_bgEffective = 1;   // runtime background mode after capability fallback
@@ -984,9 +990,8 @@ static LimitState EvalLimit(const WndInfo& w, long long now) {
     // window, which would otherwise read as "5h 01m"; clamp it away.
     if (w.windowSec > 0 && s.resetInSec > w.windowSec) s.resetInSec = w.windowSec;
     if (w.resetAt > 0 && now >= w.resetAt) {
-        // The stored percentage predates the reset, so it no longer describes
-        // the new window. Present a fresh window, but flag it as pending rather
-        // than asserting 0% used / 100% remaining as confirmed fact.
+        // The old sample cannot describe the new window. All UI consumers must
+        // show a neutral pending state until a new reset timestamp is received.
         s.resetPending = true;
         s.usedPct = 0.0;
         s.exhausted = false;
@@ -996,9 +1001,47 @@ static LimitState EvalLimit(const WndInfo& w, long long now) {
     return s;
 }
 
-static unsigned TrayResetMask(const Usage& u, long long now) {
-    return (EvalLimit(u.shortWindow, now).resetPending ? 1u : 0u)
-         | (EvalLimit(u.weeklyWindow, now).resetPending ? 2u : 0u);
+static LimitState EvalTray(const Usage& u, long long now) {
+    LimitState result;
+    if (!u.ok) return result;
+    for (const WndInfo& w : {u.shortWindow, u.weeklyWindow}) {
+        LimitState state = EvalLimit(w, now);
+        if (!state.valid) continue;
+        result.valid = true;
+        result.resetPending |= state.resetPending;
+        result.exhausted |= state.exhausted;
+        if (!state.resetPending) result.usedPct = std::max(result.usedPct, state.usedPct);
+    }
+    // A known block takes priority over an unconfirmed reset of another window.
+    if (result.exhausted) result.resetPending = false;
+    return result;
+}
+
+static COLORREF LimitColor(const LimitState& state, const Theme& theme) {
+    if (!state.valid || state.resetPending) return theme.dim;
+    if (state.exhausted) return theme.red;
+    return state.usedPct >= 70.0 ? theme.amber : theme.green;
+}
+
+static double ShownPercent(const LimitState& state, bool remaining) {
+    if (!state.valid || state.resetPending) return 0;
+    return remaining ? 100.0 - state.usedPct : state.usedPct;
+}
+
+static std::wstring LimitPercentText(const LimitState& state, bool remaining) {
+    if (!state.valid || state.resetPending) return L"—";
+    return PercentText(ShownPercent(state, remaining));
+}
+
+static std::wstring ResetDateTime(long long resetAt) {
+    if (resetAt <= 0) return L"unknown";
+    time_t t = (time_t)resetAt;
+    tm local{};
+    if (localtime_s(&local, &t) != 0) return L"unknown";
+    wchar_t text[40];
+    swprintf_s(text, L"%02d.%02d.%04d %02d:%02d", local.tm_mday, local.tm_mon + 1,
+               local.tm_year + 1900, local.tm_hour, local.tm_min);
+    return text;
 }
 
 static std::wstring PlanName(const std::wstring& plan) {
@@ -1016,11 +1059,11 @@ static std::wstring PlanName(const std::wstring& plan) {
     return plan.size() <= 24 ? plan : plan.substr(0, 23) + L"…";
 }
 
-// Shared by the tray and the widget. Compact wording leaves room for the plan
-// and the source/confidence within the tray's 127-character tooltip limit.
-static std::wstring UsageTooltip(const Usage& u, long long now, bool remaining) {
+// The widget has room for full details; the native tray tooltip is limited to
+// 127 characters. Both use the same evaluation, countdown and local reset time.
+static std::wstring UsageTooltip(const Usage& u, long long now, bool remaining, bool compact = false) {
     std::wstring tip = L"Codex | Plan: " + PlanName(u.planType);
-    if (u.stale) {
+    if (u.stale && !compact) {
         tip += L"\nSession log (";
         if (u.sampleAt <= 0) tip += L"age unknown";
         else {
@@ -1029,17 +1072,36 @@ static std::wstring UsageTooltip(const Usage& u, long long now, bool remaining) 
         }
         tip += L")";
     }
-    if (!u.ok) return tip + L"\n" + (u.error.empty() ? L"no data" : u.error);
+    if (!u.ok) {
+        tip += L"\n" + (u.error.empty() ? L"no data" : u.error);
+        return compact ? tip.substr(0, 127) : tip;
+    }
+    std::wstring rows;
     for (const WndInfo& w : {u.shortWindow, u.weeklyWindow}) {
         LimitState state = EvalLimit(w, now);
         if (!state.valid) continue;
-        tip += L"\n" + WindowLabel(w) + L": ";
-        if (state.resetPending) tip += L"~";
-        tip += PercentText(remaining ? 100.0 - state.usedPct : state.usedPct);
-        tip += remaining ? L" left" : L" used";
-        tip += state.resetPending ? L", resetting" : L", reset " + FormatRemaining(state.resetInSec, IsLongWindow(w));
+        rows += L"\n" + WindowLabel(w) + L": ";
+        if (state.resetPending) {
+            rows += compact ? L"checking reset" : L"Checking reset…";
+        } else {
+            rows += LimitPercentText(state, remaining);
+            if (!compact) rows += remaining ? L" left" : L" used";
+            rows += compact ? L" · " : L", reset in ";
+            rows += FormatRemaining(state.resetInSec, IsLongWindow(w));
+        }
+        rows += compact ? L" · " : L"\n  Reset (local): ";
+        rows += ResetDateTime(w.resetAt);
     }
-    return tip;
+    if (compact) {
+        std::wstring suffix = remaining ? L" | left (local)" : L" | used (local)";
+        if (u.stale) suffix += L" [log]";
+        std::wstring plan = PlanName(u.planType);
+        size_t fixedSize = std::wstring(L"Codex | ").size() + suffix.size() + rows.size();
+        size_t room = fixedSize < 127 ? 127 - fixedSize : 0;
+        if (plan.size() > room) plan = room > 1 ? plan.substr(0, room - 1) + L"…" : L"";
+        tip = L"Codex | " + plan + suffix;
+    }
+    return tip + rows;
 }
 
 static void EnsureFonts(int dpi, int quality = CLEARTYPE_QUALITY) {
@@ -1188,12 +1250,6 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
     const int rowH = h / rows;
     auto px = [&](int v) { return MulDiv(v, g_dpi, 96); };
 
-    auto accentFor = [&](double pct) -> COLORREF {
-        if (pct >= 99.5) return th.red;
-        if (pct >= 70.0) return th.amber;
-        return th.green;
-    };
-
     if (!u.ok) {
         std::wstring msg = u.error.empty() ? L"no Codex data" : u.error;
         int x = px(8);
@@ -1216,14 +1272,12 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
         int x = px(8);
         const long long now = (long long)time(nullptr);
         LimitState st = EvalLimit(wi, now);
-        double usedPct = st.usedPct;
         long long remain = st.resetInSec;
         bool locked = st.exhausted;
-        COLORREF accent = st.valid ? accentFor(usedPct) : th.dim;
+        COLORREF accent = LimitColor(st, th);
         // "Remaining" is the default view: a fresh window reads 100% and drains.
-        double shown = (g_cfg.displayMode == 0) ? (100.0 - usedPct) : usedPct;
-        std::wstring pctText = st.valid ? PercentText(shown) : L"—";
-        if (st.valid && st.resetPending) pctText = L"~" + pctText;   // assumed, not measured
+        double shown = ShownPercent(st, g_cfg.displayMode == 0);
+        std::wstring pctText = LimitPercentText(st, g_cfg.displayMode == 0);
 
         HBRUSH db = CreateSolidBrush(accent);
         HGDIOBJ op = SelectObject(mem, GetStockObject(NULL_PEN));
@@ -1244,7 +1298,7 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
 
         int pctX = barX + barW + px(6);
         DrawTextAt(mem, pctText, pctX, top, px(44), rowH,
-                   g_fMain, locked ? th.red : th.text, DT_LEFT | DT_VCENTER);
+                   g_fMain, st.resetPending ? th.dim : (locked ? th.red : th.text), DT_LEFT | DT_VCENTER);
 
         // The time stays pinned to the right edge; the narrower widget is what
         // shrinks the empty gap in the middle of the row.
@@ -1255,8 +1309,7 @@ static void DrawContent(HDC mem, int w, int h, const Usage& u, const Theme& th) 
         if (!st.valid) {
             timeText = L"—";
         } else if (st.resetPending) {
-            timeText = L"resetting";
-            timeColor = th.amber;
+            timeText = L"checking";
         } else if (remain > 0) {
             timeText = FormatRemaining(remain, longWindow);
             timeColor = locked ? th.red : th.dim;
@@ -1695,33 +1748,34 @@ static void UpdateTray() {
 
     const long long now = (long long)time(nullptr);
     const bool remaining = (g_cfg.displayMode == 0);
-    LimitState main = EvalLimit(MainWindow(u), now);
-    g_trayResetMask = TrayResetMask(u, now);
-
-    int pct = 0;
-    bool locked = false;
-    double usedPct = 0.0;
+    LimitState state = EvalTray(u, now);
+    int pct = (int)llround(ShownPercent(state, remaining));
+    bool locked = state.exhausted;
     Theme th = DetectTheme();
-    if (main.valid) {
-        usedPct = main.usedPct;
-        locked = main.exhausted;
-        pct = (int)llround(remaining ? 100.0 - usedPct : usedPct);
-    }
-    COLORREF col = locked ? th.red : (usedPct >= 70.0 ? th.amber : th.green);
+    COLORREF col = LimitColor(state, th);
 
-    HICON old = g_trayIcon;
-    g_trayIcon = MakeTrayIcon(pct, col, locked);
+    // Countdown-only changes update NIF_TIP without allocating a new icon.
+    bool iconChanged = !g_trayIcon || pct != g_trayPercent || col != g_trayColor || locked != g_trayLocked;
+    HICON old = nullptr;
+    if (iconChanged) {
+        old = g_trayIcon;
+        g_trayIcon = MakeTrayIcon(pct, col, locked);
+        g_trayPercent = pct;
+        g_trayColor = col;
+        g_trayLocked = locked;
+    }
 
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd = g_anchor;
     nid.uID = kTrayId;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    if (iconChanged || !g_trayAdded) nid.uFlags |= NIF_ICON;
     nid.uCallbackMessage = WM_TRAY;
     HICON fallback = LoadIconW(g_inst, MAKEINTRESOURCEW(1));
     nid.hIcon = g_trayIcon ? g_trayIcon : (fallback ? fallback : LoadIconW(nullptr, IDI_APPLICATION));
 
-    std::wstring tip = UsageTooltip(u, now, remaining);
+    std::wstring tip = UsageTooltip(u, now, remaining, true);
     wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
 
     if (!g_trayAdded) {
@@ -1729,9 +1783,11 @@ static void UpdateTray() {
             g_trayAdded = true;
             nid.uVersion = NOTIFYICON_VERSION_4;
             Shell_NotifyIconW(NIM_SETVERSION, &nid);
+            g_trayTipText = tip;
         }
-    } else {
-        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    } else if (iconChanged || tip != g_trayTipText) {
+        if (Shell_NotifyIconW(NIM_MODIFY, &nid)) g_trayTipText = tip;
+        else g_trayAdded = false; // retry registration after a shell failure
     }
     if (old && old != g_trayIcon) DestroyIcon(old);
     RefreshWidgetTooltip();
@@ -1801,6 +1857,48 @@ static void RequestRefresh() {
 // --------------------------------------------------------------------------
 //  Menu
 // --------------------------------------------------------------------------
+static INT_PTR CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM) {
+    switch (msg) {
+        case WM_INITDIALOG: {
+            SetDlgItemTextW(hwnd, IDC_ABOUT_VERSION, (L"Version " + U82W(APP_VERSION_TEXT)).c_str());
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)LoadIconW(g_inst, MAKEINTRESOURCEW(1)));
+            RECT rect{};
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetWindowRect(hwnd, &rect) && GetMonitorInfoW(
+                MonitorFromWindow(g_widget ? g_widget : hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+                int width = rect.right - rect.left, height = rect.bottom - rect.top;
+                SetWindowPos(hwnd, nullptr,
+                    monitor.rcWork.left + (monitor.rcWork.right - monitor.rcWork.left - width) / 2,
+                    monitor.rcWork.top + (monitor.rcWork.bottom - monitor.rcWork.top - height) / 2,
+                    0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            return TRUE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) == IDC_RELEASES) {
+                if ((INT_PTR)ShellExecuteW(hwnd, L"open", kReleasesUrl, nullptr, nullptr, SW_SHOWNORMAL) <= 32)
+                    MessageBoxW(hwnd, L"Could not open the releases page in your browser.", L"Codex Taskbar Monitor", MB_OK | MB_ICONERROR);
+                return TRUE;
+            }
+            if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+                EndDialog(hwnd, LOWORD(wp));
+                return TRUE;
+            }
+            break;
+        case WM_CLOSE:
+            EndDialog(hwnd, IDCANCEL);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void ShowAbout() {
+    if (g_menuOpen) return;
+    g_menuOpen = true;
+    DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_ABOUT), g_anchor, AboutProc, 0);
+    g_menuOpen = false;
+}
+
 static void ShowMenu() {
     if (g_menuOpen) return;
     g_menuOpen = true;
@@ -1859,11 +1957,7 @@ static void ShowMenu() {
     AppendMenuW(m, MF_POPUP, (UINT_PTR)interval, L"Refresh interval");
     AppendMenuW(m, MF_STRING | (IsAutostart() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    std::wstring status = u.ok
-        ? (u.stale ? std::wstring(L"Source: Codex session log") : std::wstring(L"Source: Codex API"))
-        : (L"No data: " + u.error);
-    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, status.c_str());
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, ID_ABOUT, L"About...");
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
 
     POINT pt{};
@@ -1907,6 +2001,7 @@ static void ShowMenu() {
         case ID_INT_60:  g_cfg.refreshSec = 60;  SaveConfig(); g_nextPollDue = 0; break;
         case ID_INT_120: g_cfg.refreshSec = 120; SaveConfig(); g_nextPollDue = 0; break;
         case ID_INT_300: g_cfg.refreshSec = 300; SaveConfig(); g_nextPollDue = 0; break;
+        case ID_ABOUT: ShowAbout(); break;
         case ID_EXIT: DestroyWindow(g_anchor); break;
         default:
             if (cmd >= ID_MON_BASE) {
@@ -2005,22 +2100,15 @@ static LRESULT CALLBACK AnchorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             WatchdogTick();
-            RefreshWidgetTooltip();
             if (g_widget && IsWindow(g_widget)) {
                 RECT wr{};
                 GetWindowRect(g_widget, &wr);
                 SampleBackground(wr);
                 InvalidateRect(g_widget, nullptr, FALSE);
             }
-            // A window can roll over between polls; update the tray icon and
-            // tooltip the moment that happens so they cannot disagree with the
-            // widget. Between rollovers the tray is left untouched.
-            {
-                Usage u;
-                { std::lock_guard<std::mutex> lk(g_mu); u = g_usage; }
-                unsigned pending = TrayResetMask(u, (long long)time(nullptr));
-                if (pending != g_trayResetMask) UpdateTray();
-            }
+            // Recalculate both tooltips every tick, independently of API polling.
+            // UpdateTray only sends changed text and recreates the icon on state changes.
+            UpdateTray();
             if (g_nextPollDue == 0 || GetTickCount64() >= g_nextPollDue) {
                 g_nextPollDue = GetTickCount64() + 15000;
                 RequestRefresh();

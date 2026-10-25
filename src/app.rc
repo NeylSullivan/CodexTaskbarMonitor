@@ -1,10 +1,11 @@
 #include <windows.h>
+#include "app_version.h"
 
 1 ICON "app.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION APP_VERSION_NUMBERS
+ PRODUCTVERSION APP_VERSION_NUMBERS
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -17,11 +18,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Codex Taskbar Monitor"
             VALUE "FileDescription", "Codex Taskbar Monitor"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", APP_VERSION_TEXT
             VALUE "InternalName", "CodexTaskbar"
             VALUE "OriginalFilename", "CodexTaskbar.exe"
             VALUE "ProductName", "Codex Taskbar Monitor"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", APP_VERSION_TEXT
             VALUE "LegalCopyright", "MIT License"
         END
     END
@@ -29,4 +30,17 @@ BEGIN
     BEGIN
         VALUE "Translation", 0x409, 1200
     END
+END
+
+IDD_ABOUT DIALOGEX 0, 0, 252, 112
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About Codex Taskbar Monitor"
+FONT 9, "Segoe UI"
+BEGIN
+    ICON 1, -1, 12, 13, 20, 20
+    LTEXT "Codex Taskbar Monitor", -1, 44, 12, 196, 12
+    LTEXT "", IDC_ABOUT_VERSION, 44, 28, 196, 12
+    LTEXT "Codex usage in the Windows taskbar.\nMIT License", -1, 12, 50, 228, 26
+    PUSHBUTTON "Open releases", IDC_RELEASES, 12, 87, 92, 16
+    DEFPUSHBUTTON "Close", IDOK, 178, 87, 62, 16
 END

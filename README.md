@@ -24,8 +24,9 @@ but Codex-only, dependency-free, and with taskbar hosting that behaves properly 
 | Seamless background | transparent by default (color-key, no painted background at all); two alternatives available |
 | Notifications | Windows toast when a limit is exhausted and when it becomes available again |
 | Sound | synthesized cues: descending tones for "limit reached", rising arpeggio for "available again" |
-| Tray icon | progress ring colored by state, tooltip with the plan and available windows |
-| Hover details | the tray icon and widget show the plan, percentages, reset countdowns and session-log age |
+| Tray icon | progress ring follows the most-used window; either exhausted limit turns it red |
+| Hover details | plan, percentages, synchronized countdowns and exact local reset dates; log age in the widget tooltip |
+| About | version information and a button to open GitHub releases in the browser |
 | Menu | right-click the widget, or left/right-click the tray icon |
 | Settings | refresh interval, notifications, sound, optional weekly row on plans with two windows, display direction, placement mode, monitor, autostart |
 | Resilience | widget is recreated after an `explorer.exe` restart; position and DPI re-checked every second |
@@ -71,10 +72,25 @@ The bar, the percentage, the tray ring and the tooltip all follow the selected m
 Severity colors (green → amber ≥ 70% used → red when exhausted) are derived from actual
 consumption, so `Remaining` still turns red when nothing is left.
 
+The tray ring uses the highest consumption across all available windows, including the
+weekly window when its widget row is hidden. If a reset time passes without fresh data,
+the affected widget row shows a gray empty bar, `—` and `checking`. The tray is also gray
+while a reset is unconfirmed, unless another window is still known to be exhausted.
+No full allowance is assumed before a fresh response confirms it.
+
 Hover over the tray icon or the widget's text/bar to see the account plan, for example
 `Codex | Plan: Plus` or `Codex | Plan: Pro Lite`. The plan comes from `plan_type` in the
 usage response (or session log), independently of the window lengths. Unknown plan
 identifiers are shown as supplied; if the field is missing, the tooltip says `Unknown`.
+
+Both tooltips recalculate countdowns every second, even with a five-minute API polling
+interval. Each window also shows its reset date and time as `DD.MM.YYYY HH:mm` in the
+Windows local timezone. The tray uses compact wording to fit both windows in its native
+tooltip; the widget shows the full details. Countdown updates do not recreate the icon.
+
+**About...** shows the application version and **Open releases** opens the project's
+GitHub releases page in your default browser. The menu no longer includes a Source row;
+fallback data remains marked in the widget and tooltips.
 
 Stored as `display_mode` in the config file (`0` = remaining, `1` = used).
 
@@ -100,8 +116,9 @@ Exactly one notification per state transition:
 
 1. a window reaches 100% used → **"Codex: 5-hour limit reached"**, with the reset time and
    the time left ("Resets at 13:41, in 1h 30m"), plus three descending tones;
-2. the reset time passes (or usage drops below 100%) → **"Codex: available again"**, plus a
-   rising arpeggio.
+2. fresh API data confirms the limit is available again → **"Codex: available again"**,
+   plus a rising arpeggio. Merely passing the reset time leaves the UI in a neutral
+   checking state and does not trigger this notification.
 
 ![Notification when the 5-hour limit is reached](docs/notifications.png)
 
@@ -166,8 +183,8 @@ This is the most fragile part of such apps, so several safeguards exist:
 
 2. **Fallback** — the local Codex session log
    (`%USERPROFILE%\.codex\sessions\**\rollout-*.jsonl`, last `rate_limits` entry). Used
-   automatically when the API is unreachable or the token expired. In that case the menu and
-   the tooltip say `Source: Codex session log` and the numbers only advance while you work in
+   automatically when the API is unreachable or the token expired. In that case the widget
+   tooltip says `Session log`, the tray tooltip shows `[log]`, and the numbers only advance while you work in
    the Codex CLI. The app maps `window_minutes` by duration and accepts both `resets_at`
    and the older `reset_at` spelling, ignoring other model-specific limit buckets.
 
@@ -197,8 +214,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Test
 ```
 
 Tests cover two-window and weekly-only responses, swapped window positions, session-log
-formats, missing windows, countdowns, plan tooltips and tray reset state. A Windows
-control test also checks widget tooltip callbacks and cleanup using hidden windows.
+formats, missing windows, both-limit tray state, neutral pending resets, countdowns,
+local reset dates and tooltip length. A Windows control test also checks widget tooltip
+callbacks, cleanup and the About dialog's version and buttons using hidden windows.
 Tests do not read credentials, call the API, or display notifications. Release builds
 run these tests before publishing.
 
@@ -206,6 +224,7 @@ run these tests before publishing.
 src/CodexTaskbar.cpp   ~1700 lines: WinHTTP client, JSON parser, GDI rendering, widget,
                        notifications, tray icon, menu, settings
 src/app.rc             icon and VERSIONINFO
+src/app_version.h      shared executable/About version and dialog resource IDs
 src/app.manifest       PerMonitorV2 DPI awareness, Windows 10 compatibility
 src/app.ico            exe icon (generated by tools/make_icon.ps1)
 build.ps1              one-command build

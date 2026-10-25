@@ -48,7 +48,7 @@ if ($Test) {
     & "$root\build\UsageTests.exe"
     if ($LASTEXITCODE -ne 0) { Write-Error "usage tests failed (exit $LASTEXITCODE)" }
     Invoke-Vc ("cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE " +
-               "tests\TooltipTests.cpp /Fo:build\TooltipTests.obj /Fe:build\TooltipTests.exe " +
+               "tests\TooltipTests.cpp build\app.res /Fo:build\TooltipTests.obj /Fe:build\TooltipTests.exe " +
                "/link /SUBSYSTEM:CONSOLE /MANIFEST:EMBED /MANIFESTINPUT:src\app.manifest") "compile tooltip tests"
     & "$root\build\TooltipTests.exe"
     if ($LASTEXITCODE -ne 0) { Write-Error "tooltip tests failed (exit $LASTEXITCODE)" }

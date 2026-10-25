@@ -82,14 +82,14 @@ static void TestWeeklyOnly() {
 
     u.weeklyWindow.used = 100;
     CHECK(EvalLimit(MainWindow(u), 2000532799).exhausted);
-    CHECK(TrayResetMask(u, 2000532799) == 0);
+    CHECK(EvalTray(u, 2000532799).exhausted);
     state = EvalLimit(MainWindow(u), 2000532800);
     CHECK(state.resetPending && !state.exhausted);
-    CHECK(TrayResetMask(u, 2000532800) == 2);
+    CHECK(EvalTray(u, 2000532800).resetPending);
     // Even if the short window was already pending, a weekly reset must update the tray.
     u.shortWindow = { true, 100, 2000532700, 18000 };
-    CHECK(TrayResetMask(u, 2000532799) == 1);
-    CHECK(TrayResetMask(u, 2000532800) == 3);
+    CHECK(EvalTray(u, 2000532799).exhausted);
+    CHECK(EvalTray(u, 2000532800).resetPending);
 }
 
 static void TestRolloutSchemas() {
@@ -147,7 +147,7 @@ static void TestMissingAndLegacyWindows() {
     CHECK(!u.shortWindow.valid && !u.weeklyWindow.valid);
     ReadUsageWindows(Parse(R"({"primary_window":null,"secondary_window":null})"), u, false);
     CHECK(!MainWindow(u).valid);
-    CHECK(TrayResetMask(u, 2000000000) == 0);
+    CHECK(!EvalTray(u, 2000000000).valid);
     CHECK(!ReadRolloutUsage(Parse(R"({"payload":{"rate_limits":null}})"), u));
 
     WndInfo freshWeek{ true, 0, 2000604802, 604800 };
@@ -159,9 +159,10 @@ static void TestPlanTooltips() {
     Usage u = ApiUsage(R"({"plan_type":"prolite","rate_limit":{
         "primary_window":{"used_percent":12,"reset_at":2000532800,"limit_window_seconds":604800}
     }})");
-    CHECK(UsageTooltip(u, 2000000000, true) == L"Codex | Plan: Pro Lite\nwk: 88% left, reset 6d 4h");
-    CHECK(UsageTooltip(u, 2000000000, false) == L"Codex | Plan: Pro Lite\nwk: 12% used, reset 6d 4h");
-    CHECK(UsageTooltip(u, 2000532800, true).find(L"wk: ~100% left, resetting") != std::wstring::npos);
+    CHECK(UsageTooltip(u, 2000000000, true).find(L"Codex | Plan: Pro Lite\nwk: 88% left, reset in 6d 4h") == 0);
+    CHECK(UsageTooltip(u, 2000000000, false).find(L"Codex | Plan: Pro Lite\nwk: 12% used, reset in 6d 4h") == 0);
+    CHECK(UsageTooltip(u, 2000532800, true).find(L"wk: Checking reset…") != std::wstring::npos);
+    CHECK(UsageTooltip(u, 2000532800, true).find(L"100%") == std::wstring::npos);
     CHECK(PlanName(L"plus") == L"Plus");
     CHECK(PlanName(L"pro") == L"Pro");
     CHECK(PlanName(L"business") == L"Business");
@@ -179,16 +180,102 @@ static void TestPlanTooltips() {
     CHECK(tip.find(L"Session log (age unknown)") != std::wstring::npos);
     CHECK(tip.find(L"5h: 0% left") != std::wstring::npos);
     CHECK(tip.find(L"wk: 88% left") != std::wstring::npos);
-    CHECK(tip.size() <= 127);
+    CHECK(UsageTooltip(u, 2000000000, true, true).size() <= 127);
     u.planType = L"a_future_plan_with_a_very_long_identifier";
     u.sampleAt = 1999395200;
     tip = UsageTooltip(u, 2000000000, true);
     CHECK(tip.find(L"Session log (7d 0h old)") != std::wstring::npos);
-    CHECK(tip.size() <= 127);
+    CHECK(UsageTooltip(u, 2000000000, true, true).size() <= 127);
     u.ok = false;
     u.stale = false;
     u.error = L"No network";
     CHECK(UsageTooltip(u, 2000000000, true).find(L"No network") != std::wstring::npos);
+}
+
+static void TestTrayAndPendingState() {
+    const long long now = 2000000000;
+    Usage u;
+    u.ok = true;
+    u.shortWindow = {true, 10, now + 18000, 18000};
+    u.weeklyWindow = {true, 100, now + 604800, 604800};
+    Theme th{true, 0, 1, 2, 3, 4, 5, 6};
+    LimitState state = EvalTray(u, now);
+    CHECK(state.exhausted && !state.resetPending && state.usedPct == 100);
+    CHECK(LimitColor(state, th) == th.red);
+    CHECK(ShownPercent(state, true) == 0);
+    CHECK(ShownPercent(state, false) == 100);
+    u.weeklyWindow.used = 80;
+    state = EvalTray(u, now);
+    CHECK(!state.exhausted && state.usedPct == 80);
+    CHECK(LimitColor(state, th) == th.amber);
+    CHECK(ShownPercent(state, true) == 20);
+    u.shortWindow.used = 90;
+    CHECK(EvalTray(u, now).usedPct == 90);
+
+    u.weeklyWindow.resetAt = now;
+    state = EvalLimit(u.weeklyWindow, now);
+    CHECK(state.resetPending && !state.exhausted);
+    CHECK(LimitColor(state, th) == th.dim);
+    CHECK(LimitPercentText(state, true) == L"—");
+    CHECK(LimitPercentText(state, false) == L"—");
+    CHECK(ShownPercent(state, true) == 0); // no full green bar after an unconfirmed reset
+    CHECK(EvalTray(u, now).resetPending);
+    CHECK(LimitColor(EvalTray(u, now), th) == th.dim);
+    u.shortWindow.used = 100;
+    CHECK(EvalTray(u, now).exhausted && !EvalTray(u, now).resetPending);
+    CHECK(LimitColor(EvalTray(u, now), th) == th.red);
+    u.shortWindow = {};
+    CHECK(EvalTray(u, now).resetPending);
+    u.weeklyWindow.resetAt = now + 604800;
+    u.weeklyWindow.used = 0;
+    CHECK(!EvalTray(u, now).resetPending);
+    CHECK(LimitColor(EvalTray(u, now), th) == th.green);
+    CHECK(LimitPercentText(EvalTray(u, now), true) == L"100%");
+    u.ok = false;
+    CHECK(!EvalTray(u, now).valid);
+    CHECK(LimitColor(EvalTray(u, now), th) == th.dim);
+}
+
+static void TestTooltipTimes() {
+    tm local{};
+    local.tm_year = 2030 - 1900;
+    local.tm_mon = 5 - 1;
+    local.tm_mday = 6;
+    local.tm_hour = 14;
+    local.tm_min = 7;
+    local.tm_isdst = -1;
+    long long reset = (long long)mktime(&local);
+    CHECK(ResetDateTime(reset) == L"06.05.2030 14:07");
+    CHECK(ResetDateTime(0) == L"unknown");
+    Usage u;
+    u.ok = true;
+    u.planType = L"prolite";
+    u.shortWindow = {true, 17, reset, 18000};
+    u.weeklyWindow = {true, 28, reset + 604800 - 18000, 604800};
+    long long now = reset - 18000;
+    for (bool compact : {false, true}) {
+        std::wstring before = UsageTooltip(u, now, true, compact);
+        std::wstring after = UsageTooltip(u, now + 60, true, compact);
+        CHECK(before.find(L"5h 00m") != std::wstring::npos);
+        CHECK(after.find(L"4h 59m") != std::wstring::npos);
+        CHECK(after.find(L"5h 00m") == std::wstring::npos);
+        CHECK(before.find(L"06.05.2030 14:07") != std::wstring::npos);
+        CHECK(after.find(L"06.05.2030 14:07") != std::wstring::npos);
+    }
+    for (bool remaining : {false, true}) {
+        for (bool stale : {false, true}) {
+            u.stale = stale;
+            u.planType = L"a_future_plan_with_a_very_long_identifier";
+            for (long long at : {now, reset, reset + 604800}) {
+                std::wstring tip = UsageTooltip(u, at, remaining, true);
+                CHECK(tip.size() <= 127);
+                CHECK(tip.find(ResetDateTime(u.shortWindow.resetAt)) != std::wstring::npos);
+                CHECK(tip.find(ResetDateTime(u.weeklyWindow.resetAt)) != std::wstring::npos);
+                CHECK(tip.find(L"local") != std::wstring::npos);
+                if (stale) CHECK(tip.find(L"[log]") != std::wstring::npos);
+            }
+        }
+    }
 }
 
 int main() {
@@ -197,6 +284,8 @@ int main() {
     TestRolloutSchemas();
     TestMissingAndLegacyWindows();
     TestPlanTooltips();
+    TestTrayAndPendingState();
+    TestTooltipTimes();
     std::printf("Usage tests: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

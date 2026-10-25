@@ -1,0 +1,8 @@
+#pragma once
+
+#define APP_VERSION_NUMBERS 1,1,0,0
+#define APP_VERSION_TEXT "1.1.0.0"
+
+#define IDD_ABOUT 101
+#define IDC_ABOUT_VERSION 1001
+#define IDC_RELEASES 1002
